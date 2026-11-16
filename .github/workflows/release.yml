@@ -1,0 +1,97 @@
+name: Release Decky plugin
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: decky-release
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '22'
+      - name: Set plugin version
+        id: version
+        run: |
+          # v0.1.4 was the last manual build. A rerun keeps the same version.
+          version="0.1.$((4 + GITHUB_RUN_NUMBER))"
+          npm version "$version" --no-git-tag-version --ignore-scripts
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build Decky plugin
+        run: |
+          npm install --global pnpm@10.18.3
+          pnpm install --frozen-lockfile
+          pnpm check
+          pnpm build
+          python3 -m py_compile main.py
+      - name: Package Decky-installable ZIP
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          stage=$(mktemp -d)
+          plugin="$stage/legion-go-s-power"
+          mkdir -p "$plugin/dist" release
+          install -m 0644 plugin.json package.json main.py LICENSE README.md "$plugin/"
+          install -m 0644 dist/index.js "$plugin/dist/"
+          zip="legion-go-s-power-$VERSION.zip"
+          (cd "$stage" && zip -qr "$GITHUB_WORKSPACE/release/$zip" legion-go-s-power)
+          unzip -tq "release/$zip"
+          (cd release && sha256sum "$zip" > "$zip.sha256")
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: decky-plugin
+          path: release/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: decky-plugin
+      - name: Publish ZIP to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          zip="legion-go-s-power-$VERSION.zip"
+          sha256sum --check "$zip.sha256"
+
+          # A rerun leaves an already published download in place.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists."
+            exit 0
+          fi
+
+          cat > notes.md <<EOF
+          适用于运行 SteamOS 的 Legion Go S 83Q2（Ryzen Z2 Go），使用系统现有的联想 WMI 功率控制接口。
+
+          在 Decky Loader 的「设置 → 开发者」里选择从 ZIP 安装，直接选中 $zip。也可以复制 ZIP 的下载链接，通过 URL 安装。
+
+          打开 Legion Go S Power，保存电池和插电的全局功率上限，并用「全局功率限制」开关启停。
+
+          [使用说明](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/README.md)
+          EOF
+          gh release create "$tag" "$zip" "$zip.sha256" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Legion Go S Power $tag" --notes-file notes.md
